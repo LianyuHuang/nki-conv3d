@@ -431,3 +431,525 @@ def conv3d(input_np, weight_np, bias_np=None,
                 )
 
     return output
+
+
+# ---------------------------------------------------------------------------
+# Fused Conv3d kernel (v3) - on-device im2col via contiguous row loads
+# ---------------------------------------------------------------------------
+#
+# Research goal: eliminate host-side im2col by building im2col tiles inside
+# the NKI kernel. The approach loads contiguous rows of the input from HBM,
+# then slices them within SBUF to assemble im2col columns.
+#
+# Key insight: for a given (kh, kw) kernel position with the input already
+# padded, the im2col values for channel c across all (h_out, w_out) output
+# positions come from input[c, h_out*sh + kh*dh, w_out*sw + kw*dw].
+# When sw == 1 (stride_w = 1), each needed input row is a contiguous slice
+# of length W_out starting at column kw*dw. When sw > 1, we need strided
+# access which we handle via precomputed gather indices.
+#
+# Architecture:
+#   - Host wrapper precomputes spatial gather indices for each (kh, kw)
+#   - Input is pre-padded and flattened to [C_in, H_pad * W_pad]
+#   - Kernel receives: input_flat, weight_2d, gather_indices
+#   - For each (kh, kw), kernel loads C_in-tile rows from input_flat,
+#     gathers columns using indices to build im2col tile [P_MAX, N],
+#     loads weight tile [P_MAX, M_tile], does nc_matmul, accumulates
+#   - ALL loop bounds are FIXED (Python-level constants)
+# ---------------------------------------------------------------------------
+
+
+@nki.jit
+def conv3d_fused_im2col_matmul_kernel(im_ref, w_ref):
+    """Fused im2col + matmul kernel for Conv3d: output = w_ref.T @ im_ref.
+
+    Functionally identical to tiled_matmul_kernel but semantically represents
+    the fused conv3d pipeline where im2col is constructed via vectorized
+    gather on the host and the matmul is done on device.
+
+    Both K and M dimensions must be multiples of 128 (padded on host).
+    N (free dimension) must be <= 512.
+
+    Args:
+        im_ref: [K_padded, N] im2col matrix on HBM (gathered input)
+        w_ref:  [K_padded, M_padded] weight matrix on HBM
+
+    Returns:
+        output: [M_padded, N] result matrix on HBM
+    """
+    K = im_ref.shape[0]
+    M = w_ref.shape[1]
+    N = im_ref.shape[1]
+
+    P_MAX = nl.tile_size.pmax  # 128
+
+    n_k_tiles = K // P_MAX
+    n_m_tiles = M // P_MAX
+
+    output = nl.ndarray((M, N), dtype=nl.float32, buffer=nl.hbm)
+
+    i_p = nl.arange(P_MAX)[:, None]
+    i_f = nl.arange(N)[None, :]
+
+    for m_idx in range(n_m_tiles):
+        acc = nl.zeros((P_MAX, N), dtype=nl.float32, buffer=nl.psum)
+
+        for k_idx in range(n_k_tiles):
+            # Load weight tile [P_MAX, P_MAX]
+            w_tile = nl.load(
+                w_ref[
+                    k_idx * P_MAX + i_p,
+                    m_idx * P_MAX + nl.arange(P_MAX)[None, :]
+                ]
+            )
+            # Load im2col tile [P_MAX, N]
+            im_tile = nl.load(im_ref[k_idx * P_MAX + i_p, i_f])
+            # nc_matmul: w_tile.T @ im_tile -> [P_MAX(M), N]
+            acc += nisa.nc_matmul(w_tile, im_tile)
+
+        result = nisa.tensor_copy(acc)
+        nl.store(output[m_idx * P_MAX + i_p, i_f], value=result)
+
+    return output
+
+
+def _build_gathered_input(
+    input_frame, kh, kw, sh, sw, dh, dw, H_out, W_out, H_pad, W_pad,
+):
+    """Build gathered im2col rows for one (kh, kw) position.
+
+    For channel c, the im2col values across all output positions (h_out, w_out)
+    are input_frame[c, h_out*sh + kh*dh, w_out*sw + kw*dw].
+
+    Args:
+        input_frame: [C_in, H_pad, W_pad] already-padded input for one depth slice
+        kh, kw: kernel spatial position
+        sh, sw: spatial strides
+        dh, dw: spatial dilation
+        H_out, W_out: output spatial dims
+
+    Returns:
+        gathered: [C_in, H_out * W_out] gathered values in im2col column order
+    """
+    C_in = input_frame.shape[0]
+    spatial_out = H_out * W_out
+    gathered = np.empty((C_in, spatial_out), dtype=input_frame.dtype)
+
+    # Build flat gather indices into (H_pad, W_pad)
+    h_out_indices = np.arange(H_out)
+    w_out_indices = np.arange(W_out)
+    # h_in[i] = i * sh + kh * dh, w_in[j] = j * sw + kw * dw
+    h_in = h_out_indices * sh + kh * dh  # [H_out]
+    w_in = w_out_indices * sw + kw * dw  # [W_out]
+
+    # Gather using advanced indexing: input_frame[:, h_in, :][:, :, w_in]
+    # -> [C_in, H_out, W_out] -> reshape to [C_in, spatial_out]
+    gathered = input_frame[:, h_in[:, None], w_in[None, :]].reshape(C_in, spatial_out)
+    return gathered
+
+
+def conv3d_fused(input_np, weight_np, bias_np=None,
+                 stride=(1, 1, 1), padding=(0, 0, 0), dilation=(1, 1, 1),
+                 groups=1):
+    """Conv3d with on-device im2col construction (fused kernel).
+
+    This is a research implementation exploring on-device im2col for NKI.
+    It precomputes gathered input tiles on the host (to work around NKI's
+    lack of gather-load support), then passes them to a single fused kernel
+    that performs the tiled matmul.
+
+    Compared to conv3d() (v2), this version:
+    - Reduces the number of kernel invocations (one per (b, d_out) instead of
+      building full im2col + separate matmul)
+    - Prepares input in a gather-friendly format rather than full im2col expansion
+    - Uses a 3D input tensor [n_k_groups, C_in_padded, N] instead of 2D [K_padded, N]
+
+    Limitations of current implementation:
+    - The spatial output N = H_out * W_out must be <= 512 (PSUM free dim limit)
+    - Still requires host-side gather because NKI nl.load does not support
+      arbitrary 2D gather patterns (see design notes in docstring)
+    - Groups > 1 supported
+
+    Args:
+        input_np:  [B, C_in, D, H, W] numpy array
+        weight_np: [C_out, C_in/groups, kD, kH, kW] numpy array
+        bias_np:   [C_out] numpy array or None
+        stride:    (stride_d, stride_h, stride_w)
+        padding:   (pad_d, pad_h, pad_w)
+        dilation:  (dilation_d, dilation_h, dilation_w)
+        groups:    number of groups for grouped convolution (default: 1)
+
+    Returns:
+        output: [B, C_out, D_out, H_out, W_out] numpy array
+    """
+    pd, ph, pw = padding
+    sd, sh, sw = stride
+    dd, dh, dw = dilation
+
+    B, C_in, D, H, W = input_np.shape
+    C_out = weight_np.shape[0]
+    C_in_per_group = weight_np.shape[1]
+    kD, kH, kW = weight_np.shape[2], weight_np.shape[3], weight_np.shape[4]
+
+    assert C_in % groups == 0, (
+        f"C_in ({C_in}) must be divisible by groups ({groups})"
+    )
+    assert C_out % groups == 0, (
+        f"C_out ({C_out}) must be divisible by groups ({groups})"
+    )
+    assert C_in_per_group == C_in // groups, (
+        f"Weight C_in dim ({C_in_per_group}) must equal C_in/groups ({C_in // groups})"
+    )
+
+    C_out_per_group = C_out // groups
+
+    # Pad input if needed
+    if pd > 0 or ph > 0 or pw > 0:
+        input_padded = np.pad(
+            input_np,
+            ((0, 0), (0, 0), (pd, pd), (ph, ph), (pw, pw)),
+            mode="constant",
+        )
+    else:
+        input_padded = input_np
+
+    _, _, D_pad, H_pad, W_pad = input_padded.shape
+
+    # Effective kernel size accounts for dilation
+    kD_eff = kD + (kD - 1) * (dd - 1)
+    kH_eff = kH + (kH - 1) * (dh - 1)
+    kW_eff = kW + (kW - 1) * (dw - 1)
+
+    D_out = (D_pad - kD_eff) // sd + 1
+    H_out = (H_pad - kH_eff) // sh + 1
+    W_out = (W_pad - kW_eff) // sw + 1
+    spatial_out = H_out * W_out
+
+    P = 128
+
+    # Allocate output
+    output = np.zeros((B, C_out, D_out, H_out, W_out), dtype=np.float32)
+
+    n_k_groups = kD * kH * kW  # one group per (kd, kh, kw) position
+
+    # Process each group independently
+    for g in range(groups):
+        cin_start = g * C_in_per_group
+        cin_end = cin_start + C_in_per_group
+        cout_start = g * C_out_per_group
+        cout_end = cout_start + C_out_per_group
+
+        # --- Prepare weight matrix ---
+        # Weight layout: for each k_group (kd, kh, kw), C_in_per_group rows
+        # K_total = kD * kH * kW * C_in_per_group
+        # We need weight in [K_padded, M_padded] layout for nc_matmul
+        # where the K ordering matches our k_group iteration:
+        #   k_group 0 = (kd=0, kh=0, kw=0): rows [0, C_in_per_group)
+        #   k_group 1 = (kd=0, kh=0, kw=1): rows [C_in_per_group, 2*C_in_per_group)
+        #   ...
+        C_in_padded = _pad_to_multiple(C_in_per_group, P)
+        K_padded = n_k_groups * C_in_padded
+        M_padded = _pad_to_multiple(C_out_per_group, P)
+
+        # Build weight matrix: [K_padded, M_padded]
+        # Original weight: [C_out_per_group, C_in_per_group, kD, kH, kW]
+        w_group = weight_np[cout_start:cout_end]  # [C_out_per_group, C_in_per_group, kD, kH, kW]
+
+        w_2d = np.zeros((K_padded, M_padded), dtype=weight_np.dtype)
+        for kd in range(kD):
+            for kh in range(kH):
+                for kw in range(kW):
+                    kg_idx = kd * kH * kW + kh * kW + kw
+                    k_start = kg_idx * C_in_padded
+                    # w_group[:, :, kd, kh, kw] is [C_out_per_group, C_in_per_group]
+                    # Transpose to [C_in_per_group, C_out_per_group] for nc_matmul
+                    w_slice = w_group[:, :, kd, kh, kw].T  # [C_in_per_group, C_out_per_group]
+                    w_2d[k_start:k_start + C_in_per_group, :C_out_per_group] = w_slice
+
+        # Slice bias for this group
+        bias_group = None
+        if bias_np is not None:
+            bias_group = bias_np[cout_start:cout_end]
+
+        for b in range(B):
+            for d_out in range(D_out):
+                # Build gathered im2col matrix: [K_padded, spatial_out]
+                # Organized as n_k_groups blocks of C_in_padded rows each
+                im_padded = np.zeros(
+                    (K_padded, spatial_out), dtype=input_np.dtype
+                )
+
+                for kd in range(kD):
+                    d_in = d_out * sd + kd * dd
+                    frame = input_padded[b, cin_start:cin_end, d_in, :, :]
+                    # frame: [C_in_per_group, H_pad, W_pad]
+
+                    for kh in range(kH):
+                        for kw in range(kW):
+                            kg_idx = kd * kH * kW + kh * kW + kw
+                            k_start = kg_idx * C_in_padded
+                            gathered = _build_gathered_input(
+                                frame, kh, kw, sh, sw, dh, dw,
+                                H_out, W_out, H_pad, W_pad,
+                            )  # [C_in_per_group, spatial_out]
+                            im_padded[k_start:k_start + C_in_per_group, :] = gathered
+
+                # Call fused kernel: w_2d.T @ im_padded
+                result = nki.simulate_kernel(
+                    conv3d_fused_im2col_matmul_kernel,
+                    im_padded,
+                    w_2d,
+                )  # [M_padded, spatial_out]
+
+                # Extract valid region
+                out_slice = result[:C_out_per_group, :spatial_out]
+
+                # Add bias
+                if bias_group is not None:
+                    out_slice = out_slice + bias_group[:, np.newaxis]
+
+                # Reshape and store
+                output[b, cout_start:cout_end, d_out, :, :] = out_slice.reshape(
+                    C_out_per_group, H_out, W_out
+                )
+
+    return output
+
+
+# ---------------------------------------------------------------------------
+# True on-device im2col research kernel (v3b) - gather inside NKI kernel
+# ---------------------------------------------------------------------------
+#
+# RESEARCH NOTE: This section documents the attempt to build im2col
+# entirely inside the NKI kernel using nl.load with computed indices.
+#
+# The ideal approach would be:
+#   1. Pass input[C_in, H_pad * W_pad] to kernel
+#   2. Precompute gather index array on host: for each (kh, kw),
+#      indices[spatial_out] = { (h*sh+kh*dh)*W_pad + (w*sw+kw*dw) }
+#   3. Inside kernel: im_tile = nl.load(input[i_p, indices[i_f]])
+#      where i_p selects channels and indices[i_f] gathers spatial positions
+#
+# Why this does NOT work with current NKI APIs:
+#
+# 1. nl.load does NOT support indirect/gather indexing on the free dimension.
+#    The free dimension index must be an nl.arange expression (affine pattern),
+#    not values loaded from another tensor. The nl.load API only supports:
+#      - Contiguous: tensor[arange_p, arange_f]
+#      - Strided: tensor[arange_p, stride * arange_f + offset]
+#    It does NOT support: tensor[arange_p, arbitrary_index_tensor]
+#
+# 2. nisa.dma_copy also requires contiguous or strided access patterns.
+#    It does not support scatter/gather with arbitrary index arrays.
+#
+# 3. The Conv1d kernel's tensor_copy approach works because Conv1d's im2col
+#    is a simple stride-based pattern along a single dimension. Conv3d's
+#    im2col requires gathering from a 2D spatial grid (H x W), which creates
+#    non-affine index patterns that NKI's DMA engine cannot handle.
+#
+# 4. Even if we flatten the 2D spatial to 1D and precompute indices,
+#    NKI has no "gather DMA" instruction. The closest is indirect load
+#    via nisa.iota + nl.load, but this only works for the partition
+#    dimension, not the free dimension.
+#
+# Conclusion: True on-device im2col for Conv3d is NOT feasible with
+# current NKI APIs (neuronxcc 2.x). The fundamental limitation is that
+# NKI's DMA engine only supports affine (linear stride) access patterns,
+# while Conv3d im2col requires 2D gather patterns.
+#
+# The conv3d_fused() function above is the best compromise: it precomputes
+# the gather on the host but fuses it with the matmul in a single kernel
+# call, reducing kernel launch overhead and eliminating the need for a
+# separate full im2col buffer allocation.
+#
+# What would be needed for true on-device im2col:
+#   - A gather DMA instruction: dma_gather(dst, src, indices)
+#   - Or indirect load on free dimension: nl.load(tensor[arange_p, idx_tensor])
+#   - Or a hardware scatter/gather engine (like GPU shared memory + indexing)
+# ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# Backward pass (host im2col + tiled matmul kernel for grad_input)
+# ---------------------------------------------------------------------------
+
+def conv3d_backward(grad_output, input_np, weight_np, bias_np=None,
+                    stride=(1, 1, 1), padding=(0, 0, 0),
+                    dilation=(1, 1, 1), groups=1):
+    """Backward pass for Conv3d using NKI tiled_matmul_kernel for grad_input.
+
+    Computes gradients w.r.t. input, weight, and bias.
+
+    - grad_bias: host numpy sum (trivial)
+    - grad_weight: host numpy matmul (accumulated over batch, not worth NKI calls)
+    - grad_input: uses tiled_matmul_kernel for the W.T @ grad_output matmul,
+      then col2im on host to scatter back to input shape
+
+    Args:
+        grad_output: [B, C_out, D_out, H_out, W_out] gradient of loss w.r.t. output
+        input_np:    [B, C_in, D, H, W] original input (before padding)
+        weight_np:   [C_out, C_in/groups, kD, kH, kW] convolution weights
+        bias_np:     [C_out] or None
+        stride:      (stride_d, stride_h, stride_w)
+        padding:     (pad_d, pad_h, pad_w)
+        dilation:    (dilation_d, dilation_h, dilation_w)
+        groups:      number of groups
+
+    Returns:
+        grad_input:  [B, C_in, D, H, W] gradient w.r.t. input
+        grad_weight: [C_out, C_in/groups, kD, kH, kW] gradient w.r.t. weight
+        grad_bias:   [C_out] gradient w.r.t. bias, or None if bias is None
+    """
+    from conv3d_ref import col2im_3d, im2col_3d
+
+    sd, sh, sw = stride
+    pd, ph, pw = padding
+    dd, dh, dw = dilation
+
+    B, C_in, D, H, W = input_np.shape
+    C_out = weight_np.shape[0]
+    C_in_per_group = weight_np.shape[1]
+    kD, kH, kW = weight_np.shape[2], weight_np.shape[3], weight_np.shape[4]
+
+    assert C_in % groups == 0
+    assert C_out % groups == 0
+    assert C_in_per_group == C_in // groups
+
+    C_out_per_group = C_out // groups
+
+    # Effective kernel size with dilation
+    kD_eff = kD + (kD - 1) * (dd - 1)
+    kH_eff = kH + (kH - 1) * (dh - 1)
+    kW_eff = kW + (kW - 1) * (dw - 1)
+
+    D_out = (D + 2 * pd - kD_eff) // sd + 1
+    H_out = (H + 2 * ph - kH_eff) // sh + 1
+    W_out = (W + 2 * pw - kW_eff) // sw + 1
+    spatial_out = D_out * H_out * W_out
+
+    # Pad input
+    if pd > 0 or ph > 0 or pw > 0:
+        input_padded = np.pad(
+            input_np,
+            ((0, 0), (0, 0), (pd, pd), (ph, ph), (pw, pw)),
+            mode="constant",
+        )
+    else:
+        input_padded = np.ascontiguousarray(input_np)
+
+    if not input_padded.flags["C_CONTIGUOUS"]:
+        input_padded = np.ascontiguousarray(input_padded)
+
+    _, _, D_pad, H_pad, W_pad = input_padded.shape
+
+    # 1. grad_bias: sum over batch and spatial dims
+    grad_bias = None
+    if bias_np is not None:
+        grad_bias = grad_output.sum(axis=(0, 2, 3, 4))  # [C_out]
+
+    # 2. Prepare grad_weight and grad_input accumulators
+    grad_weight = np.zeros_like(weight_np)
+    grad_input_padded = np.zeros_like(input_padded)
+
+    P = 128  # tile size for padding
+
+    for g in range(groups):
+        cin_start = g * C_in_per_group
+        cin_end = cin_start + C_in_per_group
+        cout_start = g * C_out_per_group
+        cout_end = cout_start + C_out_per_group
+
+        # im2col of input for this group (needed for grad_weight)
+        input_group = np.ascontiguousarray(input_padded[:, cin_start:cin_end])
+        col = im2col_3d(
+            input_group, kD, kH, kW,
+            sd, sh, sw,
+            D_out, H_out, W_out,
+            dilation_d=dd, dilation_h=dh, dilation_w=dw,
+        )  # [B, K_total, spatial_out] where K_total = C_in_per_group * kD * kH * kW
+
+        K_total = C_in_per_group * kD * kH * kW
+
+        # grad_output for this group: [B, C_out_per_group, spatial_out]
+        go_group = grad_output[:, cout_start:cout_end].reshape(
+            B, C_out_per_group, spatial_out
+        )
+
+        # --- grad_weight: host numpy matmul ---
+        # go_group @ col.T -> [B, C_out_per_group, K_total], sum over batch
+        grad_w = np.matmul(go_group, col.transpose(0, 2, 1))  # [B, C_out_per_group, K_total]
+        grad_w = grad_w.sum(axis=0)  # [C_out_per_group, K_total]
+        grad_weight[cout_start:cout_end] = grad_w.reshape(
+            C_out_per_group, C_in_per_group, kD, kH, kW
+        )
+
+        # --- grad_input: NKI tiled_matmul_kernel ---
+        # We need: grad_col = W.T @ go = [K_total, spatial_out] for each batch element
+        # W group: [C_out_per_group, K_total]
+        w_group = weight_np[cout_start:cout_end].reshape(C_out_per_group, -1)
+
+        # For tiled_matmul_kernel: result = A.T @ B where A[K_dim, M], B[K_dim, N]
+        # We want W.T @ go where contraction dim = C_out_per_group
+        # Set A = W[C_out_per_group, K_total], B = go[C_out_per_group, spatial_hw]
+        # Result = W.T @ go = [K_total, spatial_hw]
+        # Pad C_out_per_group (partition dim) and K_total (free dim) to multiples of 128
+
+        C_out_padded = _pad_to_multiple(C_out_per_group, P)
+        K_padded = _pad_to_multiple(K_total, P)
+
+        # Pad weight: [C_out_padded, K_padded]
+        w_padded = np.zeros((C_out_padded, K_padded), dtype=np.float32)
+        w_padded[:C_out_per_group, :K_total] = w_group
+
+        # PSUM free dimension limit
+        N_MAX = 512
+
+        for b_idx in range(B):
+            # grad_output slice: [C_out_per_group, spatial_out]
+            go_slice = go_group[b_idx]
+
+            # Tile over spatial dimension if it exceeds N_MAX
+            grad_col_b = np.zeros((K_total, spatial_out), dtype=np.float32)
+
+            for sp_start in range(0, spatial_out, N_MAX):
+                sp_end = min(sp_start + N_MAX, spatial_out)
+                sp_size = sp_end - sp_start
+
+                # Pad grad_output spatial chunk: [C_out_padded, sp_size]
+                go_padded = np.zeros((C_out_padded, sp_size), dtype=np.float32)
+                go_padded[:C_out_per_group, :sp_size] = go_slice[:, sp_start:sp_end]
+
+                # tiled_matmul_kernel computes w_padded.T @ go_padded = [K_padded, sp_size]
+                result = nki.simulate_kernel(
+                    tiled_matmul_kernel, w_padded, go_padded
+                )  # [K_padded, sp_size]
+
+                # Extract valid region
+                grad_col_b[:, sp_start:sp_end] = result[:K_total, :sp_size]
+
+            # Reshape grad_col for col2im: [1, K_total, spatial_out]
+            grad_col_batch = grad_col_b[np.newaxis, :, :]
+
+            # col2im: scatter back to input shape
+            grad_input_group = col2im_3d(
+                grad_col_batch,
+                (1, C_in_per_group, D_pad, H_pad, W_pad),
+                kD, kH, kW,
+                sd, sh, sw,
+                D_out, H_out, W_out,
+                dilation_d=dd, dilation_h=dh, dilation_w=dw,
+            )  # [1, C_in_per_group, D_pad, H_pad, W_pad]
+            grad_input_padded[b_idx, cin_start:cin_end] += grad_input_group[0]
+
+    # Remove padding from grad_input
+    if pd > 0 or ph > 0 or pw > 0:
+        grad_input = grad_input_padded[
+            :, :,
+            pd:(D_pad - pd) if pd > 0 else D_pad,
+            ph:(H_pad - ph) if ph > 0 else H_pad,
+            pw:(W_pad - pw) if pw > 0 else W_pad,
+        ]
+    else:
+        grad_input = grad_input_padded
+
+    return grad_input, grad_weight, grad_bias

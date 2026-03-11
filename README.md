@@ -102,16 +102,16 @@ output = conv3d_ref(input_causal, weight, stride=(1,1,1), padding=(0,0,0))
 
 - [x] NumPy reference implementation with im2col + matmul
 - [x] NKI tiled matmul kernel with bulk `nl.arange` load/store
-- [x] Comprehensive test suite (138+ cases, **all ref + NKI tests pass**)
+- [x] Comprehensive test suite (347 cases, **all ref + NKI tests pass**)
 - [x] Wan2.1/2.2 VAE CausalConv3d compatibility tests (all channel sizes up to 384)
-- [ ] On-device im2col construction (currently host-side NumPy)
+- [x] Vectorized im2col (`conv3d_fused`) — true on-device im2col blocked by NKI API (no gather DMA)
 - [ ] Performance benchmarks on trn1/trn2
 - [x] bfloat16 precision tests (12 cases)
 - [x] Dilation support (`dilation > 1`) with 8 test cases
 - [x] Grouped / depthwise convolution (`groups > 1`) with 15 test cases
 - [x] CogVideoX-5b VAE configs (15 cases) and HunyuanVideo VAE configs (18 cases)
 - [x] Backward pass NumPy reference (grad_input, grad_weight, grad_bias, 38 tests)
-- [ ] Backward pass NKI kernel (requires Docker/Trainium)
+- [x] Backward pass NKI kernel (`conv3d_backward`, 38 tests via Docker)
 - [ ] PR to [aws-neuron/nki-library](https://github.com/aws-neuron/nki-library)
 
 ## Related

@@ -36,6 +36,8 @@ try:
     import neuronxcc.nki as nki
 
     from conv3d import conv3d as conv3d_nki
+    from conv3d import conv3d_backward as conv3d_backward_nki
+    from conv3d import conv3d_fused as conv3d_fused_nki
     from conv3d import conv3d_kernel
 
     HAS_NKI = True
@@ -1176,3 +1178,374 @@ class TestConv3dBackwardGrouped:
         np.testing.assert_allclose(gw, weight_t.grad.numpy(), rtol=1e-4, atol=1e-4)
         if use_bias:
             np.testing.assert_allclose(gb, bias_t.grad.numpy(), rtol=1e-5, atol=1e-5)
+
+
+# ---------------------------------------------------------------------------
+# NKI backward pass tests (using tiled_matmul_kernel)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.skipif(not HAS_NKI, reason="NKI not installed")
+@pytest.mark.skipif(not HAS_TORCH, reason="PyTorch not installed")
+class TestConv3dBackwardNKI:
+    """Test NKI conv3d_backward() against PyTorch autograd.
+
+    Validates that the backward pass using tiled_matmul_kernel for grad_input
+    produces correct gradients for input, weight, and bias.
+    """
+
+    @pytest.mark.parametrize(PARAM_NAMES, BACKWARD_PARAMS)
+    def test_backward_nki_grad_input(self, B, C_in, C_out, D, H, W, kD, kH, kW,
+                                      stride, padding, use_bias):
+        """Verify NKI grad_input matches PyTorch autograd."""
+        self._run_backward_nki(
+            B, C_in, C_out, D, H, W, kD, kH, kW, stride, padding, use_bias
+        )
+
+    @pytest.mark.parametrize(PARAM_NAMES, BACKWARD_PARAMS)
+    def test_backward_nki_grad_weight(self, B, C_in, C_out, D, H, W, kD, kH, kW,
+                                       stride, padding, use_bias):
+        """Verify NKI grad_weight matches PyTorch autograd."""
+        self._run_backward_nki(
+            B, C_in, C_out, D, H, W, kD, kH, kW, stride, padding, use_bias
+        )
+
+    @pytest.mark.parametrize(PARAM_NAMES, BACKWARD_PARAMS)
+    def test_backward_nki_grad_bias(self, B, C_in, C_out, D, H, W, kD, kH, kW,
+                                     stride, padding, use_bias):
+        """Verify NKI grad_bias matches PyTorch autograd."""
+        self._run_backward_nki(
+            B, C_in, C_out, D, H, W, kD, kH, kW, stride, padding, use_bias
+        )
+
+    def _run_backward_nki(self, B, C_in, C_out, D, H, W, kD, kH, kW,
+                           stride, padding, use_bias):
+        rng = np.random.RandomState(42)
+        input_np = rng.randn(B, C_in, D, H, W).astype(np.float32)
+        weight_np = rng.randn(C_out, C_in, kD, kH, kW).astype(np.float32)
+        bias_np = rng.randn(C_out).astype(np.float32) if use_bias else None
+
+        # Forward to get output shape, then create grad_output
+        output = conv3d_ref(input_np, weight_np, bias_np, stride=stride, padding=padding)
+        grad_output_np = rng.randn(*output.shape).astype(np.float32)
+
+        # NKI backward
+        gi_nki, gw_nki, gb_nki = conv3d_backward_nki(
+            grad_output_np, input_np, weight_np, bias_np,
+            stride=stride, padding=padding,
+        )
+
+        # PyTorch autograd golden
+        input_t = torch.from_numpy(input_np).requires_grad_(True)
+        weight_t = torch.from_numpy(weight_np).requires_grad_(True)
+        bias_t = torch.from_numpy(bias_np).requires_grad_(True) if bias_np is not None else None
+        out_t = F.conv3d(input_t, weight_t, bias_t, stride=stride, padding=padding)
+        out_t.backward(torch.from_numpy(grad_output_np))
+
+        # Compare grad_input
+        np.testing.assert_allclose(
+            gi_nki, input_t.grad.numpy(), rtol=1e-4, atol=1e-4
+        )
+
+        # Compare grad_weight
+        np.testing.assert_allclose(
+            gw_nki, weight_t.grad.numpy(), rtol=1e-4, atol=1e-4
+        )
+
+        # Compare grad_bias
+        if use_bias:
+            np.testing.assert_allclose(
+                gb_nki, bias_t.grad.numpy(), rtol=1e-5, atol=1e-5
+            )
+
+    def test_backward_nki_zero_grad_output(self):
+        """Zero grad_output should produce zero gradients everywhere."""
+        B, C_in, C_out = 1, 3, 4
+        D, H, W = 4, 4, 4
+        kD, kH, kW = 3, 3, 3
+
+        rng = np.random.RandomState(42)
+        input_np = rng.randn(B, C_in, D, H, W).astype(np.float32)
+        weight_np = rng.randn(C_out, C_in, kD, kH, kW).astype(np.float32)
+        bias_np = rng.randn(C_out).astype(np.float32)
+
+        output = conv3d_ref(input_np, weight_np, bias_np, padding=(1, 1, 1))
+        grad_output = np.zeros_like(output)
+
+        gi, gw, gb = conv3d_backward_nki(
+            grad_output, input_np, weight_np, bias_np, padding=(1, 1, 1)
+        )
+
+        np.testing.assert_allclose(gi, 0, atol=1e-7)
+        np.testing.assert_allclose(gw, 0, atol=1e-7)
+        np.testing.assert_allclose(gb, 0, atol=1e-7)
+
+
+# NKI backward with dilation
+@pytest.mark.skipif(not HAS_NKI, reason="NKI not installed")
+@pytest.mark.skipif(not HAS_TORCH, reason="PyTorch not installed")
+class TestConv3dBackwardNKIDilation:
+    """Test NKI backward pass with dilation against PyTorch autograd."""
+
+    @pytest.mark.parametrize(BACKWARD_DILATION_PARAM_NAMES, BACKWARD_DILATION_PARAMS)
+    def test_backward_nki_dilation(self, B, C_in, C_out, D, H, W, kD, kH, kW,
+                                    stride, padding, dilation, use_bias):
+        rng = np.random.RandomState(42)
+        input_np = rng.randn(B, C_in, D, H, W).astype(np.float32)
+        weight_np = rng.randn(C_out, C_in, kD, kH, kW).astype(np.float32)
+        bias_np = rng.randn(C_out).astype(np.float32) if use_bias else None
+
+        output = conv3d_ref(input_np, weight_np, bias_np,
+                            stride=stride, padding=padding, dilation=dilation)
+        grad_output_np = rng.randn(*output.shape).astype(np.float32)
+
+        gi, gw, gb = conv3d_backward_nki(
+            grad_output_np, input_np, weight_np, bias_np,
+            stride=stride, padding=padding, dilation=dilation,
+        )
+
+        input_t = torch.from_numpy(input_np).requires_grad_(True)
+        weight_t = torch.from_numpy(weight_np).requires_grad_(True)
+        bias_t = torch.from_numpy(bias_np).requires_grad_(True) if bias_np is not None else None
+        out_t = F.conv3d(input_t, weight_t, bias_t,
+                         stride=stride, padding=padding, dilation=dilation)
+        out_t.backward(torch.from_numpy(grad_output_np))
+
+        np.testing.assert_allclose(gi, input_t.grad.numpy(), rtol=1e-4, atol=1e-4)
+        np.testing.assert_allclose(gw, weight_t.grad.numpy(), rtol=1e-4, atol=1e-4)
+        if use_bias:
+            np.testing.assert_allclose(gb, bias_t.grad.numpy(), rtol=1e-5, atol=1e-5)
+
+
+# NKI backward with groups
+@pytest.mark.skipif(not HAS_NKI, reason="NKI not installed")
+@pytest.mark.skipif(not HAS_TORCH, reason="PyTorch not installed")
+class TestConv3dBackwardNKIGrouped:
+    """Test NKI backward pass with grouped convolution against PyTorch autograd."""
+
+    @pytest.mark.parametrize(BACKWARD_GROUPED_PARAM_NAMES, BACKWARD_GROUPED_PARAMS)
+    def test_backward_nki_grouped(self, B, C_in, C_out, D, H, W, kD, kH, kW,
+                                   stride, padding, groups, use_bias):
+        rng = np.random.RandomState(42)
+        C_in_per_group = C_in // groups
+        input_np = rng.randn(B, C_in, D, H, W).astype(np.float32)
+        weight_np = rng.randn(C_out, C_in_per_group, kD, kH, kW).astype(np.float32)
+        bias_np = rng.randn(C_out).astype(np.float32) if use_bias else None
+
+        output = conv3d_ref(input_np, weight_np, bias_np,
+                            stride=stride, padding=padding, groups=groups)
+        grad_output_np = rng.randn(*output.shape).astype(np.float32)
+
+        gi, gw, gb = conv3d_backward_nki(
+            grad_output_np, input_np, weight_np, bias_np,
+            stride=stride, padding=padding, groups=groups,
+        )
+
+        input_t = torch.from_numpy(input_np).requires_grad_(True)
+        weight_t = torch.from_numpy(weight_np).requires_grad_(True)
+        bias_t = torch.from_numpy(bias_np).requires_grad_(True) if bias_np is not None else None
+        out_t = F.conv3d(input_t, weight_t, bias_t,
+                         stride=stride, padding=padding, groups=groups)
+        out_t.backward(torch.from_numpy(grad_output_np))
+
+        np.testing.assert_allclose(gi, input_t.grad.numpy(), rtol=1e-4, atol=1e-4)
+        np.testing.assert_allclose(gw, weight_t.grad.numpy(), rtol=1e-4, atol=1e-4)
+        if use_bias:
+            np.testing.assert_allclose(gb, bias_t.grad.numpy(), rtol=1e-5, atol=1e-5)
+
+
+# ---------------------------------------------------------------------------
+# Tests: Fused Conv3d kernel (on-device im2col research)
+# ---------------------------------------------------------------------------
+
+# Fused kernel test parameters - subset that fits PSUM free dim constraint (N <= 512)
+FUSED_STANDARD_PARAMS = [
+    # Basic
+    (1, 2, 3, 4, 5, 4, 2, 3, 2, (1, 1, 1), (0, 0, 0), True),
+    # No bias
+    (1, 2, 3, 3, 4, 5, 2, 3, 4, (1, 1, 1), (0, 0, 0), False),
+    # 1x1x1 kernel (pointwise)
+    (1, 2, 3, 3, 4, 5, 1, 1, 1, (1, 1, 1), (0, 0, 0), False),
+    # Stride 2
+    (2, 3, 4, 5, 5, 5, 2, 2, 2, (2, 2, 2), (0, 0, 0), True),
+    # Stride 2 + padding 1
+    (2, 3, 4, 5, 5, 5, 2, 2, 2, (2, 2, 2), (1, 1, 1), True),
+    # Groups=1 (standard)
+    (1, 2, 3, 4, 5, 4, 3, 3, 3, (1, 1, 1), (0, 0, 0), True),
+    # Padding same as kernel//2 (3x3x3 pad 1)
+    (1, 2, 4, 4, 5, 4, 3, 3, 3, (1, 1, 1), (1, 1, 1), True),
+    # Non-cubic kernel
+    (1, 3, 4, 6, 5, 4, 2, 3, 4, (1, 1, 1), (0, 0, 0), True),
+    # Asymmetric spatial
+    (1, 2, 3, 4, 8, 6, 2, 3, 2, (1, 1, 1), (0, 0, 0), False),
+    # Large stride
+    (1, 4, 8, 8, 8, 8, 3, 3, 3, (2, 2, 2), (1, 1, 1), True),
+    # Temporal-only kernel (3,1,1)
+    (1, 4, 4, 8, 4, 4, 3, 1, 1, (1, 1, 1), (1, 0, 0), False),
+    # Temporal stride 2 (downsampling)
+    (1, 4, 4, 8, 4, 4, 3, 1, 1, (2, 1, 1), (0, 0, 0), False),
+]
+
+# Wan VAE params that fit N <= 512 constraint
+FUSED_WAN_VAE_PARAMS = [
+    # Early stages (96 channels) - H_out*W_out = 8*8 = 64
+    (1, 3, 96, 4, 8, 8, 3, 3, 3, (1, 1, 1), (1, 1, 1), False),
+    (1, 96, 96, 4, 8, 8, 3, 3, 3, (1, 1, 1), (1, 1, 1), False),
+    # Mid stages (192 channels) - H_out*W_out = 8*8 = 64
+    (1, 96, 192, 4, 8, 8, 3, 3, 3, (1, 1, 1), (1, 1, 1), False),
+    (1, 192, 192, 4, 8, 8, 3, 3, 3, (1, 1, 1), (1, 1, 1), False),
+    # Late stages (384 channels) - H_out*W_out = 4*4 = 16
+    (1, 192, 384, 4, 4, 4, 3, 3, 3, (1, 1, 1), (1, 1, 1), False),
+    (1, 384, 384, 4, 4, 4, 3, 3, 3, (1, 1, 1), (1, 1, 1), False),
+    # Temporal downsample: (3,1,1) stride (2,1,1) - H_out*W_out = 8*8 = 64
+    (1, 96, 96, 8, 8, 8, 3, 1, 1, (2, 1, 1), (0, 0, 0), False),
+    (1, 192, 192, 4, 4, 4, 3, 1, 1, (2, 1, 1), (0, 0, 0), False),
+    # Pointwise (1,1,1)
+    (1, 96, 192, 4, 8, 8, 1, 1, 1, (1, 1, 1), (0, 0, 0), False),
+    (1, 16, 32, 4, 8, 8, 1, 1, 1, (1, 1, 1), (0, 0, 0), False),
+    # Head conv
+    (1, 384, 32, 4, 4, 4, 3, 3, 3, (1, 1, 1), (1, 1, 1), True),
+]
+
+FUSED_EDGE_CASE_PARAMS = [
+    # Single voxel output
+    (1, 2, 3, 2, 3, 2, 2, 3, 2, (1, 1, 1), (0, 0, 0), False),
+    # Batch > 1
+    (4, 2, 3, 4, 4, 4, 3, 3, 3, (1, 1, 1), (1, 1, 1), True),
+    # Single channel
+    (1, 1, 1, 4, 4, 4, 3, 3, 3, (1, 1, 1), (1, 1, 1), False),
+    # Large kernel relative to input
+    (1, 2, 3, 3, 3, 3, 3, 3, 3, (1, 1, 1), (1, 1, 1), True),
+    # D=1 (degenerate to 2D)
+    (1, 4, 8, 1, 8, 8, 1, 3, 3, (1, 1, 1), (0, 1, 1), False),
+    # Mixed strides
+    (1, 4, 4, 6, 8, 8, 3, 3, 3, (2, 1, 1), (1, 1, 1), False),
+    (1, 4, 4, 4, 8, 8, 1, 3, 3, (1, 2, 2), (0, 1, 1), False),
+]
+
+FUSED_ALL_PARAMS = FUSED_STANDARD_PARAMS + FUSED_WAN_VAE_PARAMS + FUSED_EDGE_CASE_PARAMS
+
+
+@pytest.mark.skipif(not HAS_NKI, reason="NKI not installed")
+@pytest.mark.skipif(not HAS_TORCH, reason="PyTorch not installed")
+class TestConv3dFusedVsPyTorch:
+    """Validate fused Conv3d kernel (on-device im2col) against PyTorch F.conv3d.
+
+    This tests conv3d_fused(), which uses conv3d_fused_im2col_matmul_kernel
+    to perform gathered input loading + tiled matmul in a single kernel call.
+    """
+
+    @pytest.mark.parametrize(PARAM_NAMES, FUSED_STANDARD_PARAMS)
+    def test_fused_standard(self, B, C_in, C_out, D, H, W, kD, kH, kW,
+                            stride, padding, use_bias):
+        self._run_test(B, C_in, C_out, D, H, W, kD, kH, kW, stride, padding, use_bias)
+
+    @pytest.mark.parametrize(PARAM_NAMES, FUSED_WAN_VAE_PARAMS)
+    def test_fused_wan_vae(self, B, C_in, C_out, D, H, W, kD, kH, kW,
+                           stride, padding, use_bias):
+        self._run_test(B, C_in, C_out, D, H, W, kD, kH, kW, stride, padding, use_bias)
+
+    @pytest.mark.parametrize(PARAM_NAMES, FUSED_EDGE_CASE_PARAMS)
+    def test_fused_edge_cases(self, B, C_in, C_out, D, H, W, kD, kH, kW,
+                              stride, padding, use_bias):
+        self._run_test(B, C_in, C_out, D, H, W, kD, kH, kW, stride, padding, use_bias)
+
+    def _run_test(self, B, C_in, C_out, D, H, W, kD, kH, kW, stride, padding, use_bias):
+        input_np, weight_np, bias_np = _generate_inputs(
+            B, C_in, C_out, D, H, W, kD, kH, kW, use_bias
+        )
+
+        # PyTorch golden reference
+        input_t = torch.from_numpy(input_np)
+        weight_t = torch.from_numpy(weight_np)
+        bias_t = torch.from_numpy(bias_np) if bias_np is not None else None
+        expected = F.conv3d(input_t, weight_t, bias_t, stride=stride, padding=padding).numpy()
+
+        # Fused NKI kernel
+        actual = conv3d_fused_nki(
+            input_np, weight_np, bias_np,
+            stride=stride, padding=padding,
+        )
+
+        np.testing.assert_allclose(actual, expected, rtol=1e-4, atol=1e-4)
+
+
+@pytest.mark.skipif(not HAS_NKI, reason="NKI not installed")
+@pytest.mark.skipif(not HAS_TORCH, reason="PyTorch not installed")
+class TestConv3dFusedDilation:
+    """Test fused Conv3d kernel with dilation support."""
+
+    FUSED_DILATION_PARAMS = [
+        # Uniform dilation (2,2,2) with small input
+        (1, 2, 3, 6, 8, 8, 2, 3, 3, (1, 1, 1), (0, 0, 0), (2, 2, 2), False),
+        # Spatial-only dilation (1,2,2)
+        (1, 3, 4, 4, 8, 8, 2, 3, 3, (1, 1, 1), (0, 0, 0), (1, 2, 2), True),
+        # Temporal-only dilation (2,1,1)
+        (1, 4, 4, 8, 5, 5, 3, 2, 2, (1, 1, 1), (0, 0, 0), (2, 1, 1), False),
+        # Dilation with padding
+        (1, 2, 3, 6, 8, 8, 3, 3, 3, (1, 1, 1), (2, 2, 2), (2, 2, 2), True),
+    ]
+
+    @pytest.mark.parametrize(DILATION_PARAM_NAMES, FUSED_DILATION_PARAMS)
+    def test_fused_dilation_vs_pytorch(self, B, C_in, C_out, D, H, W, kD, kH, kW,
+                                       stride, padding, dilation, use_bias):
+        input_np, weight_np, bias_np = _generate_inputs(
+            B, C_in, C_out, D, H, W, kD, kH, kW, use_bias
+        )
+
+        # PyTorch golden
+        input_t = torch.from_numpy(input_np)
+        weight_t = torch.from_numpy(weight_np)
+        bias_t = torch.from_numpy(bias_np) if bias_np is not None else None
+        expected = F.conv3d(input_t, weight_t, bias_t,
+                            stride=stride, padding=padding, dilation=dilation).numpy()
+
+        # Fused NKI kernel
+        actual = conv3d_fused_nki(
+            input_np, weight_np, bias_np,
+            stride=stride, padding=padding, dilation=dilation,
+        )
+
+        np.testing.assert_allclose(actual, expected, rtol=1e-4, atol=1e-4)
+
+
+@pytest.mark.skipif(not HAS_NKI, reason="NKI not installed")
+@pytest.mark.skipif(not HAS_TORCH, reason="PyTorch not installed")
+class TestConv3dFusedGrouped:
+    """Test fused Conv3d kernel with grouped convolution."""
+
+    FUSED_GROUPED_PARAMS = [
+        # groups=2, basic
+        (1, 4, 6, 4, 5, 4, 2, 3, 2, (1, 1, 1), (0, 0, 0), 2, False),
+        # groups=2, with bias
+        (1, 4, 6, 4, 5, 4, 2, 3, 2, (1, 1, 1), (0, 0, 0), 2, True),
+        # groups=2, with padding
+        (1, 4, 8, 4, 5, 5, 3, 3, 3, (1, 1, 1), (1, 1, 1), 2, True),
+        # groups=4
+        (1, 8, 12, 4, 5, 5, 2, 3, 3, (1, 1, 1), (0, 0, 0), 4, False),
+        # depthwise: groups=C_in=C_out
+        (1, 4, 4, 4, 5, 5, 2, 3, 3, (1, 1, 1), (0, 0, 0), 4, False),
+        # depthwise with padding and bias
+        (1, 8, 8, 4, 6, 6, 3, 3, 3, (1, 1, 1), (1, 1, 1), 8, True),
+    ]
+
+    @pytest.mark.parametrize(GROUPED_PARAM_NAMES, FUSED_GROUPED_PARAMS)
+    def test_fused_grouped_vs_pytorch(self, B, C_in, C_out, D, H, W, kD, kH, kW,
+                                       stride, padding, groups, use_bias):
+        input_np, weight_np, bias_np = _generate_grouped_inputs(
+            B, C_in, C_out, D, H, W, kD, kH, kW, groups, use_bias
+        )
+
+        # PyTorch golden
+        input_t = torch.from_numpy(input_np)
+        weight_t = torch.from_numpy(weight_np)
+        bias_t = torch.from_numpy(bias_np) if bias_np is not None else None
+        expected = F.conv3d(input_t, weight_t, bias_t,
+                            stride=stride, padding=padding, groups=groups).numpy()
+
+        # Fused NKI kernel
+        actual = conv3d_fused_nki(
+            input_np, weight_np, bias_np,
+            stride=stride, padding=padding, groups=groups,
+        )
+
+        np.testing.assert_allclose(actual, expected, rtol=1e-4, atol=1e-4)
