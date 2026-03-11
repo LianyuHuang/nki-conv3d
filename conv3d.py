@@ -38,8 +38,8 @@ Layouts:
     Bias:   [C_out]
     Output: [B, C_out, D_out, H_out, W_out]
 
-Supports: arbitrary kernel sizes, strides, symmetric padding, bias, f32/bf16.
-Limitations (v2): no dilation, no grouped convolution.
+Supports: arbitrary kernel sizes, strides, symmetric padding, dilation, bias, f32/bf16,
+grouped convolution (including depthwise).
 """
 
 import math
@@ -61,7 +61,8 @@ def _pad_to_multiple(x: int, m: int) -> int:
 
 
 def _build_im2col_2d_numpy(
-    input_frame, kH, kW, stride_h, stride_w, H_out, W_out
+    input_frame, kH, kW, stride_h, stride_w, H_out, W_out,
+    dilation_h=1, dilation_w=1,
 ):
     """Build im2col matrix for a single 2D spatial frame (no padding needed, input already padded).
 
@@ -70,6 +71,7 @@ def _build_im2col_2d_numpy(
         kH, kW: spatial kernel dims
         stride_h, stride_w: spatial strides
         H_out, W_out: output spatial dims
+        dilation_h, dilation_w: spatial dilation rates (default 1)
 
     Returns:
         col: (C_in * kH * kW, H_out * W_out) numpy array
@@ -85,8 +87,8 @@ def _build_im2col_2d_numpy(
                 row = c * kH * kW + kh * kW + kw
                 for h_out in range(H_out):
                     for w_out in range(W_out):
-                        h_in = h_out * stride_h + kh
-                        w_in = w_out * stride_w + kw
+                        h_in = h_out * stride_h + kh * dilation_h
+                        w_in = w_out * stride_w + kw * dilation_w
                         sp_idx = h_out * W_out + w_out
                         col[row, sp_idx] = input_frame[c, h_in, w_in]
     return col
@@ -286,29 +288,51 @@ def conv3d_kernel(
 # ---------------------------------------------------------------------------
 
 def conv3d(input_np, weight_np, bias_np=None,
-           stride=(1, 1, 1), padding=(0, 0, 0)):
+           stride=(1, 1, 1), padding=(0, 0, 0), dilation=(1, 1, 1),
+           groups=1):
     """
-    Conv3d with padding support.
+    Conv3d with padding, dilation, and grouped convolution support.
 
     Performs im2col on the host (NumPy), pads to multiples of 128,
     then calls tiled_matmul_kernel for the GEMM. This avoids
     variable-bound loops inside the NKI kernel.
 
+    For grouped convolution (groups > 1), the input and output channels
+    are split into `groups` independent groups, each processed separately.
+    Depthwise convolution is the special case where groups == C_in == C_out.
+
     Args:
         input_np:  [B, C_in, D, H, W] numpy array
-        weight_np: [C_out, C_in, kD, kH, kW] numpy array
+        weight_np: [C_out, C_in/groups, kD, kH, kW] numpy array
         bias_np:   [C_out] numpy array or None
         stride:    (stride_d, stride_h, stride_w)
         padding:   (pad_d, pad_h, pad_w)
+        dilation:  (dilation_d, dilation_h, dilation_w)
+        groups:    number of groups for grouped convolution (default: 1)
 
     Returns:
         output: [B, C_out, D_out, H_out, W_out] numpy array
     """
     pd, ph, pw = padding
     sd, sh, sw = stride
+    dd, dh, dw = dilation
 
     B, C_in, D, H, W = input_np.shape
-    C_out, _, kD, kH, kW = weight_np.shape
+    C_out = weight_np.shape[0]
+    C_in_per_group = weight_np.shape[1]
+    kD, kH, kW = weight_np.shape[2], weight_np.shape[3], weight_np.shape[4]
+
+    assert C_in % groups == 0, (
+        f"C_in ({C_in}) must be divisible by groups ({groups})"
+    )
+    assert C_out % groups == 0, (
+        f"C_out ({C_out}) must be divisible by groups ({groups})"
+    )
+    assert C_in_per_group == C_in // groups, (
+        f"Weight C_in dim ({C_in_per_group}) must equal C_in/groups ({C_in // groups})"
+    )
+
+    C_out_per_group = C_out // groups
 
     # Pad input if needed
     if pd > 0 or ph > 0 or pw > 0:
@@ -322,68 +346,88 @@ def conv3d(input_np, weight_np, bias_np=None,
 
     _, _, D_pad, H_pad, W_pad = input_padded.shape
 
-    D_out = (D_pad - kD) // sd + 1
-    H_out = (H_pad - kH) // sh + 1
-    W_out = (W_pad - kW) // sw + 1
+    # Effective kernel size accounts for dilation
+    kD_eff = kD + (kD - 1) * (dd - 1)
+    kH_eff = kH + (kH - 1) * (dh - 1)
+    kW_eff = kW + (kW - 1) * (dw - 1)
+
+    D_out = (D_pad - kD_eff) // sd + 1
+    H_out = (H_pad - kH_eff) // sh + 1
+    W_out = (W_pad - kW_eff) // sw + 1
     spatial_out = H_out * W_out
-
-    # Concatenate weight across kD: shape [C_out, kD * C_in * kH * kW]
-    # weight_np is [C_out, C_in, kD, kH, kW]
-    # We need w_cat[co, kd * C_in * kH * kW + c * kH * kW + kh * kW + kw]
-    # = weight_np[co, c, kd, kh, kw]
-    # Reshape: [C_out, C_in, kD, kH, kW] -> transpose to [C_out, kD, C_in, kH, kW] -> reshape
-    w_cat = weight_np.transpose(0, 2, 1, 3, 4).reshape(C_out, kD * C_in * kH * kW)
-
-    K_total = kD * C_in * kH * kW
-
-    # Transpose for nc_matmul: stationary input is [K, M] where M = C_out
-    # nc_matmul(stationary, moving) = stationary.T @ moving = [M, N]
-    w_for_matmul = w_cat.T  # [K_total, C_out]
-
-    # Pad K and M to multiples of 128
-    P = 128
-    K_padded = _pad_to_multiple(K_total, P)
-    M_padded = _pad_to_multiple(C_out, P)
-
-    # Pad weight matrix
-    w_padded = np.zeros((K_padded, M_padded), dtype=weight_np.dtype)
-    w_padded[:K_total, :C_out] = w_for_matmul
 
     # Allocate output
     output = np.zeros((B, C_out, D_out, H_out, W_out), dtype=np.float32)
 
-    for b in range(B):
-        for d_out in range(D_out):
-            # Build concatenated im2col across all kD positions
-            # im_cat shape: [kD * C_in * kH * kW, H_out * W_out]
-            im_cols = []
-            for kd in range(kD):
-                d_in = d_out * sd + kd
-                frame = input_padded[b, :, d_in, :, :]  # [C_in, H_pad, W_pad]
-                col = _build_im2col_2d_numpy(
-                    frame, kH, kW, sh, sw, H_out, W_out
-                )  # [C_in*kH*kW, spatial_out]
-                im_cols.append(col)
+    # Process each group independently
+    for g in range(groups):
+        cin_start = g * C_in_per_group
+        cin_end = cin_start + C_in_per_group
+        cout_start = g * C_out_per_group
+        cout_end = cout_start + C_out_per_group
 
-            im_cat = np.concatenate(im_cols, axis=0)  # [K_total, spatial_out]
+        # Slice weight for this group: [C_out_per_group, C_in_per_group, kD, kH, kW]
+        w_group = weight_np[cout_start:cout_end]
 
-            # Pad im2col matrix: K to K_padded (N stays as-is)
-            im_padded = np.zeros((K_padded, spatial_out), dtype=input_np.dtype)
-            im_padded[:K_total, :] = im_cat
+        # Concatenate weight across kD
+        w_cat = w_group.transpose(0, 2, 1, 3, 4).reshape(
+            C_out_per_group, kD * C_in_per_group * kH * kW
+        )
 
-            # Call tiled matmul kernel
-            result = nki.simulate_kernel(
-                tiled_matmul_kernel, w_padded, im_padded
-            )  # [M_padded, spatial_out]
+        K_total = kD * C_in_per_group * kH * kW
 
-            # Extract valid region: [C_out, spatial_out]
-            out_slice = result[:C_out, :spatial_out]
+        # Transpose for nc_matmul: stationary input is [K, M] where M = C_out_per_group
+        w_for_matmul = w_cat.T  # [K_total, C_out_per_group]
 
-            # Add bias
-            if bias_np is not None:
-                out_slice = out_slice + bias_np[:, np.newaxis]
+        # Pad K and M to multiples of 128
+        P = 128
+        K_padded = _pad_to_multiple(K_total, P)
+        M_padded = _pad_to_multiple(C_out_per_group, P)
 
-            # Reshape and store
-            output[b, :, d_out, :, :] = out_slice.reshape(C_out, H_out, W_out)
+        # Pad weight matrix
+        w_padded = np.zeros((K_padded, M_padded), dtype=weight_np.dtype)
+        w_padded[:K_total, :C_out_per_group] = w_for_matmul
+
+        # Slice bias for this group
+        bias_group = None
+        if bias_np is not None:
+            bias_group = bias_np[cout_start:cout_end]
+
+        for b in range(B):
+            for d_out in range(D_out):
+                # Build concatenated im2col across all kD positions (group channels only)
+                im_cols = []
+                for kd in range(kD):
+                    d_in = d_out * sd + kd * dd
+                    # Only use channels for this group
+                    frame = input_padded[b, cin_start:cin_end, d_in, :, :]
+                    col = _build_im2col_2d_numpy(
+                        frame, kH, kW, sh, sw, H_out, W_out,
+                        dilation_h=dh, dilation_w=dw,
+                    )  # [C_in_per_group*kH*kW, spatial_out]
+                    im_cols.append(col)
+
+                im_cat = np.concatenate(im_cols, axis=0)  # [K_total, spatial_out]
+
+                # Pad im2col matrix: K to K_padded (N stays as-is)
+                im_padded = np.zeros((K_padded, spatial_out), dtype=input_np.dtype)
+                im_padded[:K_total, :] = im_cat
+
+                # Call tiled matmul kernel
+                result = nki.simulate_kernel(
+                    tiled_matmul_kernel, w_padded, im_padded
+                )  # [M_padded, spatial_out]
+
+                # Extract valid region: [C_out_per_group, spatial_out]
+                out_slice = result[:C_out_per_group, :spatial_out]
+
+                # Add bias
+                if bias_group is not None:
+                    out_slice = out_slice + bias_group[:, np.newaxis]
+
+                # Reshape and store
+                output[b, cout_start:cout_end, d_out, :, :] = out_slice.reshape(
+                    C_out_per_group, H_out, W_out
+                )
 
     return output

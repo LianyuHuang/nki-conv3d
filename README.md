@@ -30,7 +30,7 @@ This decomposition is **exact** (not an approximation). The host-side wrapper bu
 |------|-------------|
 | `conv3d.py` | NKI kernel — the main deliverable |
 | `conv3d_ref.py` | NumPy reference (im2col + matmul) for testing |
-| `test_conv3d.py` | 35+ test cases across 3 layers |
+| `test_conv3d.py` | 138+ test cases across 3 layers |
 
 ## Test Coverage
 
@@ -38,6 +38,11 @@ This decomposition is **exact** (not an approximation). The host-side wrapper bu
 |-------|-------|--------|
 | PyTorch standard | 12 | Adapted from `torch/testing/_internal/common_nn.py` |
 | Wan2.1/2.2 VAE configs | 12 | Actual CausalConv3d shapes from `wan/modules/vae.py` |
+| CogVideoX-5b VAE configs | 15 | From `THUDM/CogVideoX-5b` vae/config.json |
+| HunyuanVideo VAE configs | 18 | From `tencent/HunyuanVideo` vae/config.json |
+| BFloat16 precision | 12 | bf16-quantized inputs vs PyTorch bf16 |
+| Dilation | 8 | Uniform, spatial-only, temporal-only, asymmetric |
+| Grouped / depthwise | 15 | groups=2/4, depthwise, with stride/padding/bias |
 | Edge cases | 7+ | Single channel, D=1, mixed strides, causal padding |
 
 All tests compare against `torch.nn.functional.conv3d` as ground truth.
@@ -97,11 +102,14 @@ output = conv3d_ref(input_causal, weight, stride=(1,1,1), padding=(0,0,0))
 
 - [x] NumPy reference implementation with im2col + matmul
 - [x] NKI tiled matmul kernel with bulk `nl.arange` load/store
-- [x] Comprehensive test suite (35+ cases, **31/31 NKI tests pass**)
+- [x] Comprehensive test suite (138+ cases, **all ref + NKI tests pass**)
 - [x] Wan2.1/2.2 VAE CausalConv3d compatibility tests (all channel sizes up to 384)
 - [ ] On-device im2col construction (currently host-side NumPy)
 - [ ] Performance benchmarks on trn1/trn2
-- [ ] bfloat16 precision tests
+- [x] bfloat16 precision tests (12 cases)
+- [x] Dilation support (`dilation > 1`) with 8 test cases
+- [x] Grouped / depthwise convolution (`groups > 1`) with 15 test cases
+- [x] CogVideoX-5b VAE configs (15 cases) and HunyuanVideo VAE configs (18 cases)
 - [ ] Backward pass (for training)
 - [ ] PR to [aws-neuron/nki-library](https://github.com/aws-neuron/nki-library)
 
