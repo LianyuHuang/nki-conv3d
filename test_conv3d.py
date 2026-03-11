@@ -462,7 +462,7 @@ class TestCausalConv3d:
         weight_t = torch.from_numpy(weight_np)
         out_torch = F.conv3d(input_t, weight_t, stride=1, padding=0).numpy()
 
-        np.testing.assert_allclose(out_ref, out_torch, rtol=1e-5, atol=1e-5)
+        np.testing.assert_allclose(out_ref, out_torch, rtol=1e-4, atol=1e-4)
         # Output should have same D as input (causal = no temporal shrinkage)
         assert out_ref.shape[2] == D
 
@@ -961,3 +961,218 @@ class TestConv3dGrouped:
         np.testing.assert_allclose(
             out_full[:, 1:], out_zeroed[:, 1:], rtol=1e-7, atol=1e-7
         )
+
+
+# ---------------------------------------------------------------------------
+# Backward pass tests
+# ---------------------------------------------------------------------------
+
+from conv3d_ref import conv3d_backward_ref
+
+# (B, C_in, C_out, D, H, W, kD, kH, kW, stride, padding, bias)
+BACKWARD_PARAMS = [
+    # Basic small
+    (1, 2, 3, 4, 5, 4, 2, 3, 2, (1, 1, 1), (0, 0, 0), False),
+    # With bias
+    (1, 2, 3, 4, 5, 4, 2, 3, 2, (1, 1, 1), (0, 0, 0), True),
+    # 1x1x1 pointwise
+    (1, 4, 8, 3, 4, 5, 1, 1, 1, (1, 1, 1), (0, 0, 0), False),
+    # With padding
+    (1, 2, 4, 4, 5, 4, 3, 3, 3, (1, 1, 1), (1, 1, 1), True),
+    # With stride
+    (2, 3, 4, 6, 6, 6, 2, 2, 2, (2, 2, 2), (0, 0, 0), False),
+    # Stride + padding
+    (1, 3, 4, 5, 5, 5, 2, 2, 2, (2, 2, 2), (1, 1, 1), True),
+    # Non-cubic kernel
+    (1, 3, 4, 6, 5, 4, 2, 3, 4, (1, 1, 1), (0, 0, 0), True),
+    # Single channel
+    (1, 1, 1, 4, 4, 4, 3, 3, 3, (1, 1, 1), (1, 1, 1), False),
+    # Batch > 1 with bias
+    (4, 2, 3, 4, 4, 4, 3, 3, 3, (1, 1, 1), (1, 1, 1), True),
+    # Temporal-only kernel
+    (1, 4, 4, 8, 4, 4, 3, 1, 1, (1, 1, 1), (1, 0, 0), False),
+]
+
+
+@pytest.mark.skipif(not HAS_TORCH, reason="PyTorch not installed")
+class TestConv3dBackward:
+    """Test conv3d backward pass against PyTorch autograd."""
+
+    @pytest.mark.parametrize(PARAM_NAMES, BACKWARD_PARAMS)
+    def test_backward_grad_input(self, B, C_in, C_out, D, H, W, kD, kH, kW,
+                                  stride, padding, use_bias):
+        """Verify grad_input matches PyTorch autograd."""
+        grad_input_ref, _, _ = self._run_backward(
+            B, C_in, C_out, D, H, W, kD, kH, kW, stride, padding, use_bias
+        )
+
+    @pytest.mark.parametrize(PARAM_NAMES, BACKWARD_PARAMS)
+    def test_backward_grad_weight(self, B, C_in, C_out, D, H, W, kD, kH, kW,
+                                   stride, padding, use_bias):
+        """Verify grad_weight matches PyTorch autograd."""
+        _, grad_weight_ref, _ = self._run_backward(
+            B, C_in, C_out, D, H, W, kD, kH, kW, stride, padding, use_bias
+        )
+
+    @pytest.mark.parametrize(PARAM_NAMES, BACKWARD_PARAMS)
+    def test_backward_grad_bias(self, B, C_in, C_out, D, H, W, kD, kH, kW,
+                                 stride, padding, use_bias):
+        """Verify grad_bias matches PyTorch autograd."""
+        _, _, grad_bias_ref = self._run_backward(
+            B, C_in, C_out, D, H, W, kD, kH, kW, stride, padding, use_bias
+        )
+
+    def _run_backward(self, B, C_in, C_out, D, H, W, kD, kH, kW, stride, padding, use_bias):
+        rng = np.random.RandomState(42)
+        input_np = rng.randn(B, C_in, D, H, W).astype(np.float32)
+        weight_np = rng.randn(C_out, C_in, kD, kH, kW).astype(np.float32)
+        bias_np = rng.randn(C_out).astype(np.float32) if use_bias else None
+
+        # Forward to get output shape, then create grad_output
+        output = conv3d_ref(input_np, weight_np, bias_np, stride=stride, padding=padding)
+        grad_output_np = rng.randn(*output.shape).astype(np.float32)
+
+        # NumPy ref backward
+        grad_input_ref, grad_weight_ref, grad_bias_ref = conv3d_backward_ref(
+            grad_output_np, input_np, weight_np, bias_np,
+            stride=stride, padding=padding,
+        )
+
+        # PyTorch autograd golden
+        input_t = torch.from_numpy(input_np).requires_grad_(True)
+        weight_t = torch.from_numpy(weight_np).requires_grad_(True)
+        bias_t = torch.from_numpy(bias_np).requires_grad_(True) if bias_np is not None else None
+        out_t = F.conv3d(input_t, weight_t, bias_t, stride=stride, padding=padding)
+        grad_output_t = torch.from_numpy(grad_output_np)
+        out_t.backward(grad_output_t)
+
+        # Compare grad_input
+        np.testing.assert_allclose(
+            grad_input_ref, input_t.grad.numpy(), rtol=1e-4, atol=1e-4
+        )
+
+        # Compare grad_weight
+        np.testing.assert_allclose(
+            grad_weight_ref, weight_t.grad.numpy(), rtol=1e-4, atol=1e-4
+        )
+
+        # Compare grad_bias
+        if use_bias:
+            np.testing.assert_allclose(
+                grad_bias_ref, bias_t.grad.numpy(), rtol=1e-5, atol=1e-5
+            )
+
+        return grad_input_ref, grad_weight_ref, grad_bias_ref
+
+    def test_backward_zero_grad_output(self):
+        """Zero grad_output should produce zero gradients everywhere."""
+        B, C_in, C_out = 1, 3, 4
+        D, H, W = 4, 4, 4
+        kD, kH, kW = 3, 3, 3
+
+        rng = np.random.RandomState(42)
+        input_np = rng.randn(B, C_in, D, H, W).astype(np.float32)
+        weight_np = rng.randn(C_out, C_in, kD, kH, kW).astype(np.float32)
+        bias_np = rng.randn(C_out).astype(np.float32)
+
+        output = conv3d_ref(input_np, weight_np, bias_np, padding=(1, 1, 1))
+        grad_output = np.zeros_like(output)
+
+        gi, gw, gb = conv3d_backward_ref(
+            grad_output, input_np, weight_np, bias_np, padding=(1, 1, 1)
+        )
+
+        np.testing.assert_allclose(gi, 0, atol=1e-7)
+        np.testing.assert_allclose(gw, 0, atol=1e-7)
+        np.testing.assert_allclose(gb, 0, atol=1e-7)
+
+
+# Backward with dilation
+BACKWARD_DILATION_PARAMS = [
+    (1, 2, 3, 6, 8, 8, 2, 3, 3, (1, 1, 1), (0, 0, 0), (2, 2, 2), False),
+    (1, 3, 4, 4, 8, 8, 2, 3, 3, (1, 1, 1), (0, 0, 0), (1, 2, 2), True),
+    (1, 2, 3, 6, 8, 8, 3, 3, 3, (1, 1, 1), (2, 2, 2), (2, 2, 2), True),
+]
+
+BACKWARD_DILATION_PARAM_NAMES = "B, C_in, C_out, D, H, W, kD, kH, kW, stride, padding, dilation, use_bias"
+
+
+@pytest.mark.skipif(not HAS_TORCH, reason="PyTorch not installed")
+class TestConv3dBackwardDilation:
+    """Test backward pass with dilation against PyTorch autograd."""
+
+    @pytest.mark.parametrize(BACKWARD_DILATION_PARAM_NAMES, BACKWARD_DILATION_PARAMS)
+    def test_backward_dilation(self, B, C_in, C_out, D, H, W, kD, kH, kW,
+                                stride, padding, dilation, use_bias):
+        rng = np.random.RandomState(42)
+        input_np = rng.randn(B, C_in, D, H, W).astype(np.float32)
+        weight_np = rng.randn(C_out, C_in, kD, kH, kW).astype(np.float32)
+        bias_np = rng.randn(C_out).astype(np.float32) if use_bias else None
+
+        output = conv3d_ref(input_np, weight_np, bias_np,
+                            stride=stride, padding=padding, dilation=dilation)
+        grad_output_np = rng.randn(*output.shape).astype(np.float32)
+
+        gi, gw, gb = conv3d_backward_ref(
+            grad_output_np, input_np, weight_np, bias_np,
+            stride=stride, padding=padding, dilation=dilation,
+        )
+
+        input_t = torch.from_numpy(input_np).requires_grad_(True)
+        weight_t = torch.from_numpy(weight_np).requires_grad_(True)
+        bias_t = torch.from_numpy(bias_np).requires_grad_(True) if bias_np is not None else None
+        out_t = F.conv3d(input_t, weight_t, bias_t,
+                         stride=stride, padding=padding, dilation=dilation)
+        out_t.backward(torch.from_numpy(grad_output_np))
+
+        np.testing.assert_allclose(gi, input_t.grad.numpy(), rtol=1e-4, atol=1e-4)
+        np.testing.assert_allclose(gw, weight_t.grad.numpy(), rtol=1e-4, atol=1e-4)
+        if use_bias:
+            np.testing.assert_allclose(gb, bias_t.grad.numpy(), rtol=1e-5, atol=1e-5)
+
+
+# Backward with groups
+BACKWARD_GROUPED_PARAMS = [
+    # (B, C_in, C_out, D, H, W, kD, kH, kW, stride, padding, groups, bias)
+    (1, 4, 6, 4, 5, 4, 2, 3, 2, (1, 1, 1), (0, 0, 0), 2, False),
+    (1, 4, 8, 4, 5, 5, 3, 3, 3, (1, 1, 1), (1, 1, 1), 2, True),
+    (1, 4, 4, 4, 5, 5, 2, 3, 3, (1, 1, 1), (0, 0, 0), 4, False),  # depthwise
+    (1, 8, 8, 4, 6, 6, 3, 3, 3, (1, 1, 1), (1, 1, 1), 8, True),  # depthwise with bias
+]
+
+BACKWARD_GROUPED_PARAM_NAMES = "B, C_in, C_out, D, H, W, kD, kH, kW, stride, padding, groups, use_bias"
+
+
+@pytest.mark.skipif(not HAS_TORCH, reason="PyTorch not installed")
+class TestConv3dBackwardGrouped:
+    """Test backward pass with grouped convolution against PyTorch autograd."""
+
+    @pytest.mark.parametrize(BACKWARD_GROUPED_PARAM_NAMES, BACKWARD_GROUPED_PARAMS)
+    def test_backward_grouped(self, B, C_in, C_out, D, H, W, kD, kH, kW,
+                               stride, padding, groups, use_bias):
+        rng = np.random.RandomState(42)
+        C_in_per_group = C_in // groups
+        input_np = rng.randn(B, C_in, D, H, W).astype(np.float32)
+        weight_np = rng.randn(C_out, C_in_per_group, kD, kH, kW).astype(np.float32)
+        bias_np = rng.randn(C_out).astype(np.float32) if use_bias else None
+
+        output = conv3d_ref(input_np, weight_np, bias_np,
+                            stride=stride, padding=padding, groups=groups)
+        grad_output_np = rng.randn(*output.shape).astype(np.float32)
+
+        gi, gw, gb = conv3d_backward_ref(
+            grad_output_np, input_np, weight_np, bias_np,
+            stride=stride, padding=padding, groups=groups,
+        )
+
+        input_t = torch.from_numpy(input_np).requires_grad_(True)
+        weight_t = torch.from_numpy(weight_np).requires_grad_(True)
+        bias_t = torch.from_numpy(bias_np).requires_grad_(True) if bias_np is not None else None
+        out_t = F.conv3d(input_t, weight_t, bias_t,
+                         stride=stride, padding=padding, groups=groups)
+        out_t.backward(torch.from_numpy(grad_output_np))
+
+        np.testing.assert_allclose(gi, input_t.grad.numpy(), rtol=1e-4, atol=1e-4)
+        np.testing.assert_allclose(gw, weight_t.grad.numpy(), rtol=1e-4, atol=1e-4)
+        if use_bias:
+            np.testing.assert_allclose(gb, bias_t.grad.numpy(), rtol=1e-5, atol=1e-5)

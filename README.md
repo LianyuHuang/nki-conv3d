@@ -110,7 +110,8 @@ output = conv3d_ref(input_causal, weight, stride=(1,1,1), padding=(0,0,0))
 - [x] Dilation support (`dilation > 1`) with 8 test cases
 - [x] Grouped / depthwise convolution (`groups > 1`) with 15 test cases
 - [x] CogVideoX-5b VAE configs (15 cases) and HunyuanVideo VAE configs (18 cases)
-- [ ] Backward pass (for training)
+- [x] Backward pass NumPy reference (grad_input, grad_weight, grad_bias, 38 tests)
+- [ ] Backward pass NKI kernel (requires Docker/Trainium)
 - [ ] PR to [aws-neuron/nki-library](https://github.com/aws-neuron/nki-library)
 
 ## Related
