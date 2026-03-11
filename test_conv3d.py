@@ -1,4 +1,4 @@
-# Copyright 2025 Lianyu Huang
+# Copyright 2026 Lianyu Huang
 #
 # Licensed under the Apache License, Version 2.0 (the "License").
 
@@ -6,7 +6,7 @@
 
 Three layers of test coverage:
     Layer 1: PyTorch standard Conv3d test cases (12 configs from torch test suite)
-    Layer 2: Video model real-world configs (Wan2.1 VAE CausalConv3d shapes)
+    Layer 2: Video model real-world configs (Wan2.1/2.2 VAE CausalConv3d shapes)
     Layer 3: Edge cases and boundary conditions
 
 All tests compare against both:
@@ -30,9 +30,10 @@ except ImportError:
 
 # Try to import NKI for kernel testing
 try:
-    import nki
+    import neuronxcc.nki as nki
 
     from conv3d import conv3d as conv3d_nki
+    from conv3d import conv3d_kernel
 
     HAS_NKI = True
 except ImportError:
@@ -73,8 +74,8 @@ PYTORCH_STANDARD_PARAMS = [
     (1, 4, 4, 8, 4, 4, 3, 1, 1, (2, 1, 1), (0, 0, 0), False),
 ]
 
-# Layer 2: Wan2.1 VAE real-world configs
-# These are the actual CausalConv3d configurations from Wan2.1's 3D VAE
+# Layer 2: Wan2.1/2.2 VAE real-world configs
+# These are the actual CausalConv3d configurations from Wan2.1/2.2's 3D VAE
 WAN_VAE_PARAMS = [
     # ResidualBlock main path: (3,3,3) stride 1, pad 1
     # Early stages (96 channels)
@@ -192,20 +193,10 @@ class TestConv3dNKIVsPyTorch:
         bias_t = torch.from_numpy(bias_np) if bias_np is not None else None
         expected = F.conv3d(input_t, weight_t, bias_t, stride=stride, padding=padding).numpy()
 
-        # NKI kernel via baremetal
-        stride_d, stride_h, stride_w = stride
-        pad_d, pad_h, pad_w = padding
-        baremetal_fn = nki.baremetal(conv3d)
-        actual = baremetal_fn(
-            input_np,
-            weight_np,
-            bias_np,
-            stride_d=stride_d,
-            stride_h=stride_h,
-            stride_w=stride_w,
-            pad_d=pad_d,
-            pad_h=pad_h,
-            pad_w=pad_w,
+        # NKI kernel via conv3d wrapper (pads input, then calls kernel)
+        actual = conv3d_nki(
+            input_np, weight_np, bias_np,
+            stride=stride, padding=padding,
         )
 
         np.testing.assert_allclose(actual, expected, rtol=1e-4, atol=1e-4)
@@ -268,7 +259,7 @@ class TestConv3dRefStandalone:
 
 @pytest.mark.skipif(not HAS_TORCH, reason="PyTorch not installed")
 class TestCausalConv3d:
-    """Test causal (asymmetric temporal) padding pattern used by Wan2.1 VAE.
+    """Test causal (asymmetric temporal) padding pattern used by Wan2.1/2.2 VAE.
 
     CausalConv3d pads (2*pad_t, 0) temporally instead of (pad_t, pad_t).
     This is done OUTSIDE the kernel via F.pad, then conv3d with pad_d=0.

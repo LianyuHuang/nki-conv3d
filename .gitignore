@@ -7,3 +7,4 @@ build/
 *.neff
 *.ntff
 .DS_Store
+.pytest_cache/

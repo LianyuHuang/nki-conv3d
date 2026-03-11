@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nki-conv3d"
+version = "0.1.0"
+description = "First NKI Conv3d kernel for AWS Trainium — enables video generation models on Neuron"
+requires-python = ">=3.10"
+license = {text = "Apache-2.0"}
+authors = [{name = "Lianyu Huang"}]
+keywords = ["nki", "trainium", "conv3d", "neuron", "aws", "video-generation"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = ["numpy"]
+
+[project.optional-dependencies]
+neuron = [
+    "neuronx-cc>=2.0",
+]
+test = [
+    "pytest",
+    "torch",
+]
+
+[project.urls]
+Repository = "https://github.com/LianyuHuang/nki-conv3d"
+
+[tool.setuptools]
+py-modules = ["conv3d", "conv3d_ref"]
+
+[tool.pytest.ini_options]
+testpaths = ["."]

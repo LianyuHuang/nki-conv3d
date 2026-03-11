@@ -22,7 +22,7 @@ Conv3d is decomposed into temporal slices of Conv2d, each computed via im2col + 
 output[:, :, d, :, :] = Σ_{kd} Conv2d(input[:, :, d*s+kd, :, :], weight[:, :, kd, :, :])
 ```
 
-This decomposition is **exact** (not an approximation). The GEMM leverages the NeuronCore matrix multiplication engine via `nisa.nc_matmul`.
+This decomposition is **exact** (not an approximation). The host-side wrapper builds im2col matrices and pads all dimensions to multiples of 128, then a tiled NKI matmul kernel runs the GEMM via `nisa.nc_matmul`.
 
 ## Files
 
@@ -37,39 +37,47 @@ This decomposition is **exact** (not an approximation). The GEMM leverages the N
 | Layer | Cases | Source |
 |-------|-------|--------|
 | PyTorch standard | 12 | Adapted from `torch/testing/_internal/common_nn.py` |
-| Wan2.1 VAE configs | 12 | Actual CausalConv3d shapes from `wan/modules/vae.py` |
+| Wan2.1/2.2 VAE configs | 12 | Actual CausalConv3d shapes from `wan/modules/vae.py` |
 | Edge cases | 7+ | Single channel, D=1, mixed strides, causal padding |
 
 All tests compare against `torch.nn.functional.conv3d` as ground truth.
 
 ## Quick Start
 
-### Run tests (NumPy reference only, no NKI needed)
+### Run reference tests (any machine, no NKI needed)
 
 ```bash
 pip install numpy pytest torch
 pytest test_conv3d.py -k "Ref" -v
 ```
 
-### Run NKI kernel tests (requires neuronxcc)
+### Run NKI kernel tests via Docker (macOS / any machine)
+
+`neuronxcc` only runs on x86_64 Linux. Use Docker:
 
 ```bash
-pip install neuronxcc  # or install NeuronSDK
-pytest test_conv3d.py -k "NKI" -v
+docker build --platform linux/amd64 -t nki-conv3d .
+docker run --platform linux/amd64 nki-conv3d
 ```
 
-The NKI kernel runs via `nki.baremetal` (CPU simulation) — **no Trainium hardware required** for development and testing.
+This uses `nki.simulate_kernel` — **no Trainium hardware required**.
+
+### Run NKI kernel tests directly (x86_64 Linux only)
+
+```bash
+pip install neuronx-cc==2.* numpy torch pytest \
+    --extra-index-url=https://pip.repos.neuron.amazonaws.com
+pytest test_conv3d.py -k "NKI" -v
+```
 
 ### Use in your model
 
 ```python
-import nki
 from conv3d import conv3d
 
-# CPU simulation
-result = nki.baremetal(conv3d)(input_np, weight_np, bias_np,
-                                stride_d=1, stride_h=1, stride_w=1,
-                                pad_d=1, pad_h=1, pad_w=1)
+# Calls NKI tiled_matmul_kernel internally (CPU simulation, no hardware needed)
+result = conv3d(input_np, weight_np, bias_np,
+                stride=(1, 1, 1), padding=(1, 1, 1))
 ```
 
 ## CausalConv3d (Wan2.1/2.2 VAE)
@@ -88,10 +96,10 @@ output = conv3d_ref(input_causal, weight, stride=(1,1,1), padding=(0,0,0))
 ## Roadmap
 
 - [x] NumPy reference implementation with im2col + matmul
-- [x] NKI kernel with temporal decomposition + nc_matmul
-- [x] Comprehensive test suite (35+ cases)
-- [x] Wan2.1 VAE CausalConv3d compatibility tests
-- [ ] Bulk DMA loading for im2col (replace element-wise loads)
+- [x] NKI tiled matmul kernel with bulk `nl.arange` load/store
+- [x] Comprehensive test suite (35+ cases, **31/31 NKI tests pass**)
+- [x] Wan2.1/2.2 VAE CausalConv3d compatibility tests (all channel sizes up to 384)
+- [ ] On-device im2col construction (currently host-side NumPy)
 - [ ] Performance benchmarks on trn1/trn2
 - [ ] bfloat16 precision tests
 - [ ] Backward pass (for training)
